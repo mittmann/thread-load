@@ -43,6 +43,7 @@ thread_t libtload_threads[MAX_THREADS] __attribute__ ((aligned(CACHE_LINE_SIZE))
 uint32_t libtload_nthreads_total = 0;
 static uint32_t alive_nthreads = 0;
 static spinlock_t threads_lock = SPINLOCK_INIT;
+static spinlock_t first_lock = SPINLOCK_INIT;
 
 static thread_t *alive_threads[MAX_THREADS];
 thread_t *libtload_threads_by_order[MAX_THREADS];
@@ -50,7 +51,8 @@ thread_t *libtload_threads_by_order[MAX_THREADS];
 static real_args_t vec[MAX_THREADS];
 static int veci = 0;
 static uint32_t order = 0;
-
+static int started = 0;
+static uint64_t s_jiffies = 0;
 #define WRAPPER_LABEL(LABEL)                     LABEL
 #define REAL_LABEL(LABEL)                        libtload_connect_real_##LABEL
 #define DECLARE_WRAPPER(LABEL, RETTYPE, ...)     static RETTYPE (*REAL_LABEL(LABEL)) (__VA_ARGS__) = NULL
@@ -62,7 +64,7 @@ static thread_t dummy_thread = {
 	.order_id = 0
 };
 static __thread thread_t *thread = (thread_t*)&dummy_thread;
-
+thread_t *first_thread;
 #define ATTACH_FUNC_(FUNC, MUST) \
 	if (unlikely(REAL_LABEL(FUNC) == NULL)) {\
 		REAL_LABEL(FUNC) = dlsym(RTLD_NEXT, #FUNC); \
@@ -191,7 +193,7 @@ static thread_t* thread_created (uint32_t order)
 	
 	spinlock_unlock(&threads_lock);
 	
-	dprintf("thread created %u kpid %u ktid %u\n", t->order_id, (uint32_t)t->kernel_pid, (uint32_t)t->kernel_tid);
+	//dprintf("thread created %u kpid %u ktid %u\n", t->order_id, (uint32_t)t->kernel_pid, (uint32_t)t->kernel_tid);
 
 	return t;
 }
@@ -217,7 +219,7 @@ static void thread_destroyed (thread_t *t)
 	
 	spinlock_unlock(&threads_lock);
 
-	dprintf("thread destroyed (order_id=%u old_pos=%u new_pos=%u)\n", t->order_id, old_pos, new_pos);
+	//dprintf("thread destroyed (order_id=%u old_pos=%u new_pos=%u)\n", t->order_id, old_pos, new_pos);
 }
 
 static void* create_head (void *arg)
@@ -238,7 +240,7 @@ static void* create_head (void *arg)
 	return r;
 }
 
-int WRAPPER_LABEL(pthread_create) (pthread_t *thread, const pthread_attr_t *attr, void *(*start_routine)(void*), void *arg)
+int WRAPPER_LABEL(pthread_create) (pthread_t *a_thread, const pthread_attr_t *attr, void *(*start_routine)(void*), void *arg)
 {
 	real_args_t *args;
 	int pos;
@@ -256,7 +258,21 @@ int WRAPPER_LABEL(pthread_create) (pthread_t *thread, const pthread_attr_t *attr
 	args->fn = start_routine;
 	args->order = get_next_order_id();
 
-	return REAL_LABEL(pthread_create)(thread, attr, create_head, args);
+	spinlock_lock(&first_lock);
+	if(!started)
+    {  
+		started=1;
+		s_jiffies = get_thread_load(thread->kernel_pid, thread->kernel_tid);
+		#ifdef LIBTLOAD_SUPPORT_PAPI
+			libtload_papi_init();
+		#endif
+
+		#ifdef LIBTLOAD_SUPPORT_PAPI
+			libtload_papi_thread_init(thread);
+		#endif
+}
+	spinlock_unlock(&first_lock);
+	return REAL_LABEL(pthread_create)(a_thread, attr, create_head, args);
 }
 
 void WRAPPER_LABEL(pthread_exit) (void *retval)
@@ -281,19 +297,12 @@ static void __attribute__((constructor)) triggered_on_app_start ()
 	
 	ASSERT((sizeof(thread_t) % CACHE_LINE_SIZE) == 0)
 	ASSERT(sizeof(unsigned long) == sizeof(void*))
+	
 
 	init();
-#ifdef LIBTLOAD_SUPPORT_PAPI
-	libtload_papi_init();
-#endif
-
 	thread = thread_created( get_next_order_id() );
-
-#ifdef LIBTLOAD_SUPPORT_PAPI
-	libtload_papi_thread_init(thread);
-#endif
-
-	dprintf("initialized!\n");
+	//first_thread = thread_created( 0 );
+	//dprintf("initialized!\n");
 }
 
 static void __attribute__((destructor)) triggered_on_app_end ()
@@ -302,7 +311,7 @@ static void __attribute__((destructor)) triggered_on_app_end ()
 	thread_t *t;
 	uint64_t load;
 	
-	dprintf("app ended, %u threads were created\n", libtload_nthreads_total);
+	//dprintf("app ended, %u threads were created\n", libtload_nthreads_total);
 
 #ifdef LIBTLOAD_SUPPORT_PAPI
 {
@@ -314,8 +323,16 @@ static void __attribute__((destructor)) triggered_on_app_end ()
 	libtload_papi_finish();
 }
 #endif
-	
-	for (i=0; i<libtload_nthreads_total; i++) {
+
+		t = libtload_threads_by_order[0];
+		
+		if (likely(t) && t->stat == THREAD_ALIVE) {
+			load = get_thread_load(t->kernel_pid, t->kernel_tid);
+			dprintf("starting jiffies: %d\n", s_jiffies);
+			stat_printf(t->order_id, "jiffies", load - s_jiffies);
+		}
+		
+	for (i=1; i<libtload_nthreads_total; i++) {
 		t = libtload_threads_by_order[i];
 		
 		if (likely(t) && t->stat == THREAD_ALIVE) {
